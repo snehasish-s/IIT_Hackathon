@@ -21,6 +21,12 @@ from src.causal_analysis import analyze_causes
 from src.early_warning import detect_early_warning, detect_multi_signal_warning, analyze_escalation_risk
 from src.config import SIGNAL_CONFIG, EARLY_WARNING_CONFIG
 
+# NEW: Import causal reasoning modules
+from src.causal_chains import CausalChainDetector
+from src.causal_query_engine import CausalQueryEngine
+from src.explanation_generator import ExplanationGenerator
+from src.query_context import QueryContext, SessionManager
+
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -34,7 +40,10 @@ _cache = {
     'transcripts': None,
     'processed': None,
     'signals': None,
-    'warnings': None
+    'warnings': None,
+    'detector': None,  # NEW: Causal chain detector
+    'query_engine': None,  # NEW: Query engine
+    'session_manager': None  # NEW: Multi-turn session manager
 }
 
 def load_data():
@@ -47,6 +56,20 @@ def load_data():
         logger.info("Preprocessing data...")
         _cache['processed'] = preprocess_transcripts(_cache['transcripts'])
         logger.info(f"Preprocessed {len(_cache['processed'])} conversations")
+        
+        # NEW: Initialize causal modules
+        logger.info("Computing causal chains...")
+        _cache['detector'] = CausalChainDetector()
+        _cache['detector'].compute_chain_statistics(_cache['transcripts'], _cache['processed'])
+        logger.info(f"Found {len(_cache['detector'].chain_stats)} causal chains")
+        
+        # Create transcript dict for query engine
+        transcripts_dict = {t["transcript_id"]: t for t in _cache['transcripts']}
+        _cache['query_engine'] = CausalQueryEngine(_cache['detector'], transcripts_dict, _cache['processed'])
+        logger.info("Initialized query engine")
+        
+        # Initialize session manager
+        _cache['session_manager'] = SessionManager()
     
     return _cache['transcripts'], _cache['processed']
 
@@ -274,6 +297,188 @@ def get_transcript(transcript_id):
     except Exception as e:
         logger.error(f"Error in get_transcript: {str(e)}")
         return jsonify({'success': False, 'error': str(e)}), 500
+
+# ============================================================================
+# NEW ENDPOINTS: CAUSAL REASONING
+# ============================================================================
+
+@app.route('/api/explain/<transcript_id>', methods=['GET'])
+def explain_transcript(transcript_id):
+    """
+    MAIN CAUSAL QUERY: "Why did this transcript escalate?"
+    
+    Returns full causal explanation with evidence and confidence
+    """
+    try:
+        transcripts, processed = load_data()
+        query_engine = _cache['query_engine']
+        
+        # Get explanation
+        explanation = query_engine.explain_escalation(transcript_id)
+        if not explanation:
+            return jsonify({
+                'success': False, 
+                'error': f'Transcript {transcript_id} not found or cannot be analyzed'
+            }), 404
+        
+        # Format response using ExplanationGenerator
+        response = ExplanationGenerator._format_explanation_response(explanation)
+        
+        return jsonify({'success': True, 'data': response})
+    except Exception as e:
+        logger.error(f"Error in explain_transcript: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/similar/<transcript_id>', methods=['GET'])
+def find_similar(transcript_id):
+    """
+    Find transcripts with similar causal patterns
+    """
+    try:
+        transcripts, processed = load_data()
+        query_engine = _cache['query_engine']
+        
+        # Get top N similar cases
+        similar_ids = query_engine.find_similar_cases(transcript_id, top_k=10)
+        
+        result = {
+            'reference_transcript': transcript_id,
+            'similar_cases': similar_ids,
+            'count': len(similar_ids)
+        }
+        
+        return jsonify({'success': True, 'data': result})
+    except Exception as e:
+        logger.error(f"Error in find_similar: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/chain-stats', methods=['GET'])
+def get_chain_stats():
+    """
+    Get statistics on all detected causal chains
+    
+    Optional query params:
+    - min_confidence: Filter chains above this confidence (0.0-1.0)
+    - min_evidence: Minimum number of supporting transcripts
+    """
+    try:
+        transcripts, processed = load_data()
+        detector = _cache['detector']
+        
+        # Get query parameters
+        min_confidence = float(request.args.get('min_confidence', 0.3))
+        min_evidence = int(request.args.get('min_evidence', 5))
+        
+        # Filter chains
+        chains = []
+        for chain_key, stats in detector.chain_stats.items():
+            if stats['confidence'] >= min_confidence and stats['occurrences'] >= min_evidence:
+                chains.append({
+                    'chain': list(chain_key),
+                    'chain_string': ' → '.join(chain_key),
+                    'confidence': round(stats['confidence'], 3),
+                    'confidence_interval': [round(x, 3) for x in stats['confidence_interval']],
+                    'occurrences': stats['occurrences'],
+                    'escalated_count': stats['escalated_count'],
+                    'resolved_count': stats['resolved_count']
+                })
+        
+        # Sort by confidence
+        chains.sort(key=lambda x: x['confidence'], reverse=True)
+        
+        result = {
+            'total_chains': len(detector.chain_stats),
+            'filtered_chains': len(chains),
+            'filters_applied': {
+                'min_confidence': min_confidence,
+                'min_evidence': min_evidence
+            },
+            'chains': chains[:50]  # Limit to top 50
+        }
+        
+        return jsonify({'success': True, 'data': result})
+    except Exception as e:
+        logger.error(f"Error in get_chain_stats: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/query', methods=['POST'])
+def query_engine_endpoint():
+    """
+    Multi-turn query interface
+    
+    POST body:
+    {
+        "session_id": "optional_session_id",
+        "question": "Why did ABC123 escalate?",
+        "transcript_id": "optional_context"
+    }
+    """
+    try:
+        transcripts, processed = load_data()
+        query_engine = _cache['query_engine']
+        session_manager = _cache['session_manager']
+        
+        # Get request data
+        data = request.get_json() or {}
+        question = data.get('question', '').strip()
+        session_id = data.get('session_id')
+        
+        if not question:
+            return jsonify({'success': False, 'error': 'No question provided'}), 400
+        
+        # Get or create session
+        if session_id:
+            context = session_manager.get_session(session_id)
+            if not context:
+                context = session_manager.create_session(session_id)
+        else:
+            context = session_manager.create_session()
+            session_id = context.session_id
+        
+        # Parse and answer question
+        response = query_engine.query(question, context.get_context())
+        
+        # Record query
+        context.add_query(
+            question=question,
+            response_type=response.get('type', 'query'),
+            response_data=response,
+            transcript_id=response.get('transcript_id')
+        )
+        
+        return jsonify({
+            'success': True,
+            'session_id': session_id,
+            'data': response
+        })
+    except Exception as e:
+        logger.error(f"Error in query_engine_endpoint: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/session/<session_id>', methods=['GET'])
+def get_session(session_id):
+    """
+    Get session context (query history, current state)
+    """
+    try:
+        session_manager = _cache['session_manager']
+        context = session_manager.get_session(session_id)
+        
+        if not context:
+            return jsonify({'success': False, 'error': 'Session not found'}), 404
+        
+        return jsonify({
+            'success': True,
+            'data': context.export_session()
+        })
+    except Exception as e:
+        logger.error(f"Error in get_session: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)}), 500
+
 
 @app.route('/api/health', methods=['GET'])
 def health():

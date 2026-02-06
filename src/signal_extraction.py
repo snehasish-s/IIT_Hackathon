@@ -182,3 +182,99 @@ def print_signal_summary(processed_turns):
         percentage = (count / len(processed_turns)) * 100 if processed_turns else 0
         print(f"  {signal:<25} {count:>6}  ({percentage:>5.1f}%)")
     print("─" * 40)
+
+
+def extract_signals_temporal(turn):
+    """
+    Extract signals WITH temporal metadata
+    
+    Args:
+        turn (dict): A turn with 'speaker', 'text', and optionally 'turn_number' keys
+    
+    Returns:
+        dict: {
+            "signals": ["customer_frustration"],
+            "turn_number": 5,
+            "speaker": "customer",
+            "confidence": 0.85
+        }
+    """
+    signals = extract_signals(turn)
+    confidence = max([get_signal_confidence(turn, s) for s in signals], default=0.0)
+    
+    return {
+        "signals": signals,
+        "turn_number": turn.get("turn_number", 0),
+        "speaker": turn.get("speaker", "unknown"),
+        "confidence": confidence,
+        "text": turn.get("text", "")
+    }
+
+
+def build_temporal_signal_sequence(transcript_id, processed_turns):
+    """
+    Build ordered list of signals for a transcript
+    Enables temporal causality analysis: "Did frustration PRECEDE response delay?"
+    
+    Args:
+        transcript_id (str): ID of transcript to analyze
+        processed_turns (list): All processed turns
+    
+    Returns:
+        list: Ordered signals with turn numbers
+        [
+            {"turn": 3, "signal": "customer_frustration", "confidence": 0.9},
+            {"turn": 5, "signal": "agent_delay", "confidence": 0.7},
+            {"turn": 8, "signal": "customer_frustration", "confidence": 0.95}
+        ]
+    """
+    # Filter turns for this transcript
+    transcript_turns = [t for t in processed_turns 
+                       if t.get("transcript_id") == transcript_id]
+    
+    # Sort by turn number
+    transcript_turns.sort(key=lambda t: t.get("turn_number", 0))
+    
+    # Extract signals with temporal info
+    signal_timeline = []
+    for turn in transcript_turns:
+        signals = extract_signals(turn)
+        for signal in signals:
+            signal_timeline.append({
+                "turn": turn.get("turn_number", 0),
+                "signal": signal,
+                "confidence": get_signal_confidence(turn, signal),
+                "speaker": turn.get("speaker", ""),
+                "text": turn.get("text", "")
+            })
+    
+    return signal_timeline
+
+
+def has_precedence(signal_timeline, signal_a, signal_b, max_gap=10):
+    """
+    Check if signal_a occurs before signal_b in a timeline
+    Useful for temporal causality: "Did frustration PRECEDE response?"
+    
+    Args:
+        signal_timeline: Output from build_temporal_signal_sequence
+        signal_a: First signal type
+        signal_b: Second signal type
+        max_gap: Maximum turns between signals (None for no limit)
+    
+    Returns:
+        bool: True if signal_a precedes signal_b
+    """
+    turns_a = [s["turn"] for s in signal_timeline if s["signal"] == signal_a]
+    turns_b = [s["turn"] for s in signal_timeline if s["signal"] == signal_b]
+    
+    if not turns_a or not turns_b:
+        return False
+    
+    first_a = min(turns_a)
+    first_b = min(turns_b)
+    
+    if max_gap is None:
+        return first_a < first_b
+    else:
+        return first_a < first_b and (first_b - first_a) <= max_gap
